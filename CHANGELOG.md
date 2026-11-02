@@ -34,3 +34,11 @@
 - 调用宿主 `vlm` 任务生成中文动图描述，并作为文本段注入原消息（原图片组件保持不变）；
 - 描述缓存（JSON、LRU、按天清理）、每条消息识别上限、并发限制、超时与失败降级；
 - 支持合并转发节点中的动图与 emoji 动图。
+# 0.2.0 — maintenance fork
+
+- Preserve original messages; deliver generated animation descriptions only as attributed, scoped request context.
+- Coalesce same-image work, enforce cache TTL, save success promptly, preserve corrupt files and unknown requests.
+- Bound admission/decode work; preserve real in-flight occupancy on timeout/config reload/unload.
+- Fix pre-process mention timing, cumulative-time sampling, APNG poster handling and actual pixel budgets.
+- Keep default4096 output tokens; empty-response escalation is opt-in, unknown/timeout requests never automatically replay.
+- Add actual-SDK offline tests, allowlisted isolated packaging and exact-commit two-platform CI gates; no auto-deployment.

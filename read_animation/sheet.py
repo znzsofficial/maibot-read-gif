@@ -62,7 +62,9 @@ def fit_frame_edge(
         tile_height = max(1, int(round(source_height * scale)))
         cell_width = max(tile_width, ESTIMATED_LABEL_WIDTH)
         sheet_width = column_count * (cell_width + 2 * SHEET_PADDING)
-        sheet_height = SHEET_BANNER_HEIGHT + row_count * (tile_height + SHEET_LABEL_HEIGHT + 2 * SHEET_PADDING)
+        sheet_height = SHEET_BANNER_HEIGHT + row_count * (
+            tile_height + SHEET_LABEL_HEIGHT + 2 * SHEET_PADDING
+        )
         sheet_pixels = sheet_width * sheet_height
         if sheet_pixels <= budget:
             break
@@ -84,6 +86,7 @@ def build_frame_sheet(
     max_edge: int,
     columns: int,
     background: str,
+    max_sheet_pixels: int = 8_000_000,
 ) -> tuple[bytes, str]:
     """渲染并编码帧板。
 
@@ -100,7 +103,9 @@ def build_frame_sheet(
 
     tiles: list[tuple[Image.Image, str]] = []
     for sample in samples:
-        frame = reader.render_frame(sample.index, max_edge=max_edge, background=background)
+        frame = reader.render_frame(
+            sample.index, max_edge=max_edge, background=background
+        )
         label = f"#{sample.index}  t={sample.start_ms}ms  d={sample.duration_ms}ms"
         tiles.append((frame, label))
 
@@ -117,7 +122,11 @@ def build_frame_sheet(
     cell_height = max(frame.height for frame, _ in tiles)
 
     sheet_width = column_count * (cell_width + 2 * SHEET_PADDING)
-    sheet_height = SHEET_BANNER_HEIGHT + row_count * (cell_height + SHEET_LABEL_HEIGHT + 2 * SHEET_PADDING)
+    sheet_height = SHEET_BANNER_HEIGHT + row_count * (
+        cell_height + SHEET_LABEL_HEIGHT + 2 * SHEET_PADDING
+    )
+    if sheet_width * sheet_height > max_sheet_pixels:
+        raise ValueError("实际帧板像素超过预算")
 
     keep_alpha = background == "keep"
     canvas_mode = "RGBA" if keep_alpha else "RGB"
@@ -133,7 +142,11 @@ def build_frame_sheet(
         column = position % column_count
         row = position // column_count
         cell_left = column * (cell_width + 2 * SHEET_PADDING) + SHEET_PADDING
-        cell_top = SHEET_BANNER_HEIGHT + row * (cell_height + SHEET_LABEL_HEIGHT + 2 * SHEET_PADDING) + SHEET_PADDING
+        cell_top = (
+            SHEET_BANNER_HEIGHT
+            + row * (cell_height + SHEET_LABEL_HEIGHT + 2 * SHEET_PADDING)
+            + SHEET_PADDING
+        )
         offset_x = cell_left + (cell_width - frame.width) // 2
         offset_y = cell_top + (cell_height - frame.height) // 2
         canvas.paste(frame, (offset_x, offset_y))

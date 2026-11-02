@@ -12,6 +12,8 @@ import base64
 import hashlib
 import logging
 import time
+import json
+from threading import Event
 
 from .cache import DescriptionCache
 from .config import FramesSection, ReadAnimationConfig
@@ -21,7 +23,6 @@ from .sniff import AnimationKind, detect_animation_kind
 from .vlm import (
     PROMPT_VERSION,
     LlmGenerate,
-    VlmDescriptionError,
     VlmEmptyResponseError,
     describe_frame_sheet,
 )
@@ -61,6 +62,8 @@ def analyze_animation(
     frames_config: FramesSection,
     *,
     build_sheet: bool = True,
+    deadline: float = float("inf"),
+    cancelled: Event | None = None,
 ) -> AnimationAnalysis:
     """解码动图并按需生成帧板（同步函数，应在线程池中调用）。
 
@@ -78,13 +81,22 @@ def analyze_animation(
         AnimationReadError: 动图解码失败时抛出。
     """
 
-    reader = AnimationReader(data, kind, max_scan_frames=int(frames_config.max_total_frames))
+    reader = AnimationReader(
+        data,
+        kind,
+        max_scan_frames=int(frames_config.max_total_frames),
+        max_decode_pixels=frames_config.max_decode_pixels,
+        deadline=deadline,
+        cancelled=cancelled,
+    )
     try:
         meta = reader.meta
         if meta.frame_count <= 1:
             raise NotAnimatedError("图片只有一帧")
 
-        if meta.scan_truncated or meta.frame_count > int(frames_config.max_total_frames):
+        if meta.scan_truncated or meta.frame_count > int(
+            frames_config.max_total_frames
+        ):
             return AnimationAnalysis(
                 meta=meta,
                 sheet_bytes=b"",
@@ -103,7 +115,9 @@ def analyze_animation(
             )
 
         if not build_sheet:
-            return AnimationAnalysis(meta=meta, sheet_bytes=b"", sheet_media_type="", sampled_count=0)
+            return AnimationAnalysis(
+                meta=meta, sheet_bytes=b"", sheet_media_type="", sampled_count=0
+            )
 
         samples = reader.sample(int(frames_config.max_frames))
         if not samples:
@@ -123,6 +137,7 @@ def analyze_animation(
             max_edge=frame_edge,
             columns=int(frames_config.columns),
             background=str(frames_config.background),
+            max_sheet_pixels=frames_config.max_sheet_pixels,
         )
         return AnimationAnalysis(
             meta=meta,
@@ -155,23 +170,42 @@ class AnimationProcessor:
             cache_path: 缓存文件路径；``None`` 表示不启用缓存。
         """
 
-        self._config = config
+        self._config = config.model_copy(deep=True)
         self._llm_generate = llm_generate
         self._logger = logger
         self._cache_path = cache_path
-        self._cache: DescriptionCache | None = self._build_cache(cache_path, config)
-        self._semaphore = asyncio.Semaphore(max(1, int(config.perf.max_concurrent)))
+        self._cache = self._build_cache(cache_path, config)
+        self._epoch = 0
+        self._ready = False
+        self._closed = False
+        self._messages = 0
+        self._jobs: dict[str, asyncio.Task] = {}
+        self._waiters: dict[str, int] = {}
+        self._decodes: set[asyncio.Task] = set()
+        self._requests: set[asyncio.Task] = set()
+        self._lifecycle = asyncio.Lock()
 
     async def initialize(self) -> None:
         """加载缓存。"""
 
-        if self._cache is not None:
+        async with self._lifecycle:
+            if self._closed:
+                return
             await self._cache.load()
+            self._ready = True
 
     async def close(self) -> None:
         """保存缓存并释放资源。"""
 
-        if self._cache is not None:
+        async with self._lifecycle:
+            self._closed = True
+            self._ready = False
+            self._epoch += 1
+            await self._cancel_jobs()
+            for task in list(self._requests):
+                task.cancel()
+            if self._requests:
+                await asyncio.gather(*list(self._requests), return_exceptions=True)
             await self._cache.close()
 
     async def update_config(self, config: ReadAnimationConfig) -> None:
@@ -181,20 +215,47 @@ class AnimationProcessor:
             config: 新的插件配置。
         """
 
-        old_cache = self._cache
-        self._config = config
-        self._semaphore = asyncio.Semaphore(max(1, int(config.perf.max_concurrent)))
-        if old_cache is not None:
-            await old_cache.close()
-        self._cache = self._build_cache(self._cache_path, config)
-        if self._cache is not None:
-            await self._cache.load()
+        async with self._lifecycle:
+            if self._closed:
+                return
+            self._ready = False
+            self._epoch += 1
+            await self._cancel_jobs()
+            self._config = config.model_copy(deep=True)
+            # Keep the same store/attempts and live decode/request accounting.
+            await self._cache.configure(
+                max_entries=config.cache.max_entries,
+                retention_days=config.cache.retention_days,
+            )
+            self._ready = True
 
-    def _build_cache(self, cache_path: Path | None, config: ReadAnimationConfig) -> DescriptionCache | None:
+    async def _cancel_jobs(self):
+        tasks = list(self._jobs.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _valid(self, epoch):
+        return self._ready and not self._closed and epoch == self._epoch
+
+    @staticmethod
+    def _track(task, collection):
+        collection.add(task)
+
+        def completed(done):
+            collection.discard(done)
+            if not done.cancelled():
+                done.exception()  # retrieve errors even after all waiters have left
+
+        task.add_done_callback(completed)
+        return task
+
+    def _build_cache(
+        self, cache_path: Path | None, config: ReadAnimationConfig
+    ) -> DescriptionCache | None:
         """按配置构造缓存对象。"""
 
-        if cache_path is None or not config.cache.enabled:
-            return None
         return DescriptionCache(
             cache_path,
             max_entries=int(config.cache.max_entries),
@@ -202,7 +263,9 @@ class AnimationProcessor:
             logger=self._logger,
         )
 
-    async def process_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+    async def process_message(
+        self, message: dict[str, Any], *, annotations: list[str] | None = None
+    ) -> dict[str, Any] | None:
         """处理一条入站消息。
 
         Args:
@@ -213,7 +276,12 @@ class AnimationProcessor:
         """
 
         cfg = self._config
-        if not cfg.plugin.enabled or cfg.trigger.trigger_mode == "off":
+        epoch = self._epoch
+        if (
+            not self._valid(epoch)
+            or not cfg.plugin.enabled
+            or cfg.trigger.trigger_mode == "off"
+        ):
             return None
         if not self._should_process_message(message):
             return None
@@ -222,9 +290,28 @@ class AnimationProcessor:
         if not isinstance(raw_message, list) or not raw_message:
             return None
 
+        if self._messages >= cfg.perf.max_pending:
+            return None
+        self._messages += 1
         deadline = time.monotonic() + MESSAGE_BUDGET_SECONDS
-        budget = {"remaining": max(0, int(cfg.trigger.max_images_per_message))}
-        new_raw_message = await self._process_component_list(raw_message, budget, deadline, depth=0)
+        budget = {
+            "remaining": max(0, int(cfg.trigger.max_images_per_message)),
+            "components": 128,
+        }
+        try:
+            new_raw_message = await self._process_component_list(
+                raw_message,
+                budget,
+                deadline,
+                depth=0,
+                cfg=cfg,
+                epoch=epoch,
+                annotations=annotations,
+            )
+        finally:
+            self._messages -= 1
+        if not self._valid(epoch):
+            return None
         if new_raw_message is None:
             return None
 
@@ -242,7 +329,36 @@ class AnimationProcessor:
             return True
 
         message_info = message.get("message_info")
-        group_info = message_info.get("group_info") if isinstance(message_info, Mapping) else None
+        group_info = (
+            message_info.get("group_info")
+            if isinstance(message_info, Mapping)
+            else None
+        )
+        additional = (
+            message_info.get("additional_config", {})
+            if isinstance(message_info, Mapping)
+            else {}
+        )
+        # Adapter-owned flags exist before Host computes the top-level markers.
+        if isinstance(additional, Mapping) and (
+            additional.get("at_bot") or additional.get("is_mentioned")
+        ):
+            return True
+        account = message.get("account_id")
+        for component in message.get("raw_message", [])[:128]:
+            if not isinstance(component, Mapping):
+                continue
+            if component.get("type") == "at" and isinstance(
+                component.get("data"), Mapping
+            ):
+                if account and component["data"].get("target_user_id") == account:
+                    return True
+            if (
+                component.get("type") == "reply"
+                and account
+                and component.get("target_message_sender_id") == account
+            ):
+                return True
         return not group_info
 
     async def _process_component_list(
@@ -252,29 +368,53 @@ class AnimationProcessor:
         deadline: float,
         *,
         depth: int,
+        cfg: ReadAnimationConfig,
+        epoch: int,
+        annotations: list[str] | None,
     ) -> list[Any] | None:
         """递归处理消息组件列表，返回注入后的新列表或 ``None``。"""
 
         changed = False
         output: list[Any] = []
-        for component in components:
+        for index, component in enumerate(components):
+            if (
+                budget["components"] <= 0
+                or not self._valid(epoch)
+                or time.monotonic() >= deadline
+            ):
+                # Preserve untouched source components without additional decode/model work.
+                output.extend(components[index:])
+                break
+            budget["components"] -= 1
             if not isinstance(component, Mapping):
                 output.append(component)
                 continue
 
             component_type = str(component.get("type") or "")
             if component_type == "forward" and depth < MAX_FORWARD_DEPTH:
-                rewritten_forward = await self._rewrite_forward(component, budget, deadline, depth + 1)
+                rewritten_forward = await self._rewrite_forward(
+                    component,
+                    budget,
+                    deadline,
+                    depth + 1,
+                    cfg=cfg,
+                    epoch=epoch,
+                    annotations=annotations,
+                )
                 if rewritten_forward is not None:
                     output.append(rewritten_forward)
                     changed = True
                     continue
 
             if component_type in HANDLED_COMPONENT_TYPES:
-                injected_text = await self._build_injection(component, budget, deadline)
+                injected_text = await self._build_injection(
+                    component, budget, deadline, cfg=cfg, epoch=epoch
+                )
                 if injected_text:
                     output.append(component)
                     output.append({"type": "text", "data": injected_text})
+                    if annotations is not None:
+                        annotations.append(injected_text)
                     changed = True
                     continue
 
@@ -288,6 +428,10 @@ class AnimationProcessor:
         budget: dict[str, int],
         deadline: float,
         depth: int,
+        *,
+        cfg: ReadAnimationConfig,
+        epoch: int,
+        annotations: list[str] | None,
     ) -> Mapping[str, Any] | None:
         """递归处理合并转发节点里的动图。"""
 
@@ -306,7 +450,15 @@ class AnimationProcessor:
                 rewritten_nodes.append(node)
                 continue
 
-            new_content = await self._process_component_list(content, budget, deadline, depth=depth)
+            new_content = await self._process_component_list(
+                content,
+                budget,
+                deadline,
+                depth=depth,
+                cfg=cfg,
+                epoch=epoch,
+                annotations=annotations,
+            )
             if new_content is None:
                 rewritten_nodes.append(node)
                 continue
@@ -327,10 +479,11 @@ class AnimationProcessor:
         component: Mapping[str, Any],
         budget: dict[str, int],
         deadline: float,
+        *,
+        cfg: ReadAnimationConfig,
+        epoch: int,
     ) -> str | None:
-        """为单个图片/表情组件生成注入文本。"""
-
-        cfg = self._config
+        """Bound admission before decode; coalesce simultaneous identical images."""
         component_type = str(component.get("type") or "")
         if component_type == "image" and not cfg.trigger.handle_images:
             return None
@@ -340,221 +493,195 @@ class AnimationProcessor:
         raw_base64 = component.get("binary_data_base64")
         if not isinstance(raw_base64, str) or not raw_base64:
             return None
-        try:
-            data = base64.b64decode(raw_base64, validate=False)
-        except Exception:
+        if (
+            len(raw_base64) > ((cfg.frames.max_input_bytes + 2) // 3) * 4
+            or not raw_base64.isascii()
+        ):
             return None
-        if not data or len(data) > int(cfg.frames.max_input_bytes):
-            return None
-
-        kind = detect_animation_kind(data)
-        if kind is None:
-            return None
-
-        cache_key = self._cache_key(data)
-        cached = await self._get_cached(cache_key)
+        # The encoded content identity allows same-image admission before allocating decoded data.
+        digest = hashlib.sha256(raw_base64.encode("ascii")).hexdigest()
+        fingerprint = json.dumps(
+            [PROMPT_VERSION, cfg.frames.model_dump(), cfg.vlm.model_dump()],
+            sort_keys=True,
+        )
+        key = digest + ":" + hashlib.sha256(fingerprint.encode()).hexdigest()
+        cached = await self._cache.get(key) if cfg.cache.enabled else None
         if cached is not None:
-            return self._format_text(str(cached["header"]), str(cached["description"]))
+            return self._format_text(cached["header"], cached["description"], cfg=cfg)
+        if not self._valid(epoch):
+            return None
+        job = self._jobs.get(key)
+        if job is None:
+            if (
+                len(self._jobs) >= cfg.perf.max_pending
+                or len(self._decodes) >= cfg.perf.max_concurrent
+            ):
+                return None
+            can_describe = budget["remaining"] > 0
+            # Reserve the per-message unique-image allowance before creating its shared job.
+            if can_describe:
+                budget["remaining"] -= 1
+            job = asyncio.create_task(
+                self._analyze_unique(
+                    raw_base64, digest, key, cfg, epoch, deadline, can_describe
+                )
+            )
+            self._jobs[key] = job
 
-        can_describe = budget["remaining"] > 0 and deadline > time.monotonic()
-        started_at = time.monotonic()
+            def done(task):
+                if self._jobs.get(key) is task:
+                    self._jobs.pop(key, None)
+                if not task.cancelled():
+                    task.exception()
+
+            job.add_done_callback(done)
+        self._waiters[key] = self._waiters.get(key, 0) + 1
         try:
-            analysis = await asyncio.to_thread(
-                analyze_animation,
+            result = await asyncio.wait_for(
+                asyncio.shield(job), max(0.001, deadline - time.monotonic())
+            )
+            return result if self._valid(epoch) else None
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.CancelledError:
+            if not self._valid(epoch):
+                return None
+            raise
+        finally:
+            count = self._waiters.get(key, 1) - 1
+            if count:
+                self._waiters[key] = count
+            else:
+                self._waiters.pop(key, None)
+                if not job.done():
+                    job.cancel()
+
+    async def _analyze_unique(
+        self, raw_base64, digest, key, cfg, epoch, deadline, can_describe
+    ):
+        cancelled = Event()
+
+        def decode():
+            data = base64.b64decode(raw_base64, validate=True)
+            if not data or len(data) > cfg.frames.max_input_bytes:
+                return None
+            if base64.b64encode(data).decode("ascii") != raw_base64:
+                return None  # Do not bypass durable same-content identity with alternate padding.
+            kind = detect_animation_kind(data)
+            if kind is None:
+                return None
+            return analyze_animation(
                 data,
                 kind,
                 cfg.frames,
                 build_sheet=can_describe,
+                deadline=deadline,
+                cancelled=cancelled,
             )
-        except NotAnimatedError:
-            return None
-        except AnimationReadError as exc:
-            self._logger.debug("跳过无法解析的动图: %s", exc)
-            return None
-        except Exception:
-            self._logger.warning("解析动图时出现异常，已跳过", exc_info=True)
-            return None
 
-        analyzed_at = time.monotonic()
-
+        decode_task = self._track(
+            asyncio.create_task(asyncio.to_thread(decode)), self._decodes
+        )
+        try:
+            analysis = await asyncio.wait_for(
+                asyncio.shield(decode_task), max(0.001, deadline - time.monotonic())
+            )
+        except (ValueError, AnimationReadError, asyncio.TimeoutError):
+            return None
+        finally:
+            cancelled.set()
+        if analysis is None or not self._valid(epoch):
+            return None
         header = self._build_header(analysis.meta)
         if analysis.skip_reason:
             skip_text = SKIP_REASON_TEXT.get(analysis.skip_reason, "未做视觉识别")
-            return self._format_text(header, "", note=skip_text)
-
+            return self._format_text(header, "", note=skip_text, cfg=cfg)
         if not can_describe:
-            reason = "已达每条消息识别上限" if budget["remaining"] <= 0 else "处理超时"
-            return self._format_text(header, "", note=reason)
-
-        budget["remaining"] -= 1
-        description = await self._describe(analysis, header, deadline)
-        finished_at = time.monotonic()
-        elapsed_ms = (finished_at - started_at) * 1000.0
-        analysis_ms = (analyzed_at - started_at) * 1000.0
-        vlm_ms = (finished_at - analyzed_at) * 1000.0
-        if description is None:
-            self._logger.info(
-                "动图识别失败，降级为元信息: %s %.0fms（解析 %.0fms / 视觉 %.0fms）",
-                kind,
-                elapsed_ms,
-                analysis_ms,
-                vlm_ms,
-            )
-            return self._format_text(header, "", note="视觉描述不可用")
-
-        await self._store_cached(cache_key, header=header, description=description, kind=kind)
-        self._logger.info(
-            "动图识别完成: %s %sx%s %s帧 %.0fms（解析 %.0fms / 视觉 %.0fms，帧板 %s列@%spx）",
-            kind,
-            analysis.meta.width,
-            analysis.meta.height,
-            analysis.meta.frame_count,
-            elapsed_ms,
-            analysis_ms,
-            vlm_ms,
-            cfg.frames.columns,
-            analysis.frame_edge,
+            return self._format_text(header, "", note="已达每条消息识别上限", cfg=cfg)
+        attempt_key = (
+            digest
+            + ":"
+            + hashlib.sha256(
+                json.dumps([cfg.vlm.task_name, cfg.vlm.model_name]).encode()
+            ).hexdigest()
         )
-        return self._format_text(header, description)
-
-    async def _describe(
-        self,
-        analysis: AnimationAnalysis,
-        header: str,
-        deadline: float,
-    ) -> str | None:
-        """在超时与并发限制内调用视觉模型。
-
-        思考模型（如 deepseek-flash-think）会把思考内容计入 ``max_tokens``；
-        当正文为空时自动提高额度重试一次，避免直接降级成"视觉描述不可用"。
-        """
-
-        cfg = self._config
-        remaining_seconds = deadline - time.monotonic()
-        if remaining_seconds <= 1.0:
-            return None
-
-        timeout_seconds = min(cfg.vlm.timeout_ms / 1000.0, remaining_seconds)
-        max_tokens = max(64, int(cfg.vlm.max_tokens))
-
-        try:
-            return await self._run_vlm(analysis, header, max_tokens, timeout_seconds)
-        except VlmEmptyResponseError as exc:
-            retry_tokens = min(
-                max(max_tokens * 4, EMPTY_RESPONSE_RETRY_MIN_TOKENS),
-                EMPTY_RESPONSE_RETRY_MAX_TOKENS,
-            )
-            retry_seconds = min(timeout_seconds, deadline - time.monotonic())
-            if retry_tokens <= max_tokens or retry_seconds <= 3.0:
-                self._logger.warning("动图视觉描述为空且无法重试: %s", exc)
+        max_tokens = cfg.vlm.max_tokens
+        for attempt in range(2 if cfg.vlm.retry_empty_response else 1):
+            if not self._valid(epoch) or time.monotonic() >= deadline:
                 return None
-
-            self._logger.warning(
-                "动图视觉描述为空（%s），将 max_tokens %s → %s 重试一次",
-                exc,
-                max_tokens,
-                retry_tokens,
-            )
-            try:
-                return await self._run_vlm(analysis, header, retry_tokens, retry_seconds)
-            except asyncio.TimeoutError:
-                self._logger.warning("动图视觉描述重试超时: %.1fs", retry_seconds)
-                return None
-            except VlmDescriptionError as retry_exc:
-                self._logger.warning("动图视觉描述重试失败: %s", retry_exc)
-                return None
-            except Exception:
-                self._logger.warning("动图视觉描述重试异常", exc_info=True)
-                return None
-        except asyncio.TimeoutError:
-            self._logger.warning("动图视觉描述超时: %.1fs", timeout_seconds)
-            return None
-        except VlmDescriptionError as exc:
-            self._logger.warning("动图视觉描述失败: %s", exc)
-            return None
-        except Exception:
-            self._logger.warning("动图视觉描述异常", exc_info=True)
-            return None
-
-    async def _run_vlm(
-        self,
-        analysis: AnimationAnalysis,
-        header: str,
-        max_tokens: int,
-        timeout_seconds: float,
-    ) -> str:
-        """执行一次视觉模型调用，返回非空描述或抛出对应异常。"""
-
-        cfg = self._config
-
-        async def call_with_semaphore() -> str:
-            async with self._semaphore:
-                return await describe_frame_sheet(
-                    self._llm_generate,
-                    sheet_bytes=analysis.sheet_bytes,
-                    sheet_media_type=analysis.sheet_media_type,
-                    header=header,
-                    sampled_count=analysis.sampled_count,
-                    total_frames=analysis.meta.frame_count,
-                    task_name=cfg.vlm.task_name.strip(),
-                    model_name=cfg.vlm.model_name.strip(),
-                    temperature=float(cfg.vlm.temperature),
-                    max_tokens=max_tokens,
-                    max_chars=int(cfg.vlm.max_chars),
+            if not await self._cache.begin(attempt_key, cfg.perf.max_concurrent):
+                return self._format_text(
+                    header, "", note="识别繁忙或先前请求结果未知", cfg=cfg
                 )
 
-        description = await asyncio.wait_for(call_with_semaphore(), timeout=timeout_seconds)
-        normalized = description.strip()
-        if not normalized:
-            raise VlmEmptyResponseError("视觉模型返回空描述")
-        return normalized
+            async def call(tokens=max_tokens):
+                known = False
+                try:
+                    if not self._valid(epoch) or time.monotonic() >= deadline:
+                        known = True  # No capability was dispatched, so it is safe to release.
+                        return ""
+                    result = await describe_frame_sheet(
+                        self._llm_generate,
+                        sheet_bytes=analysis.sheet_bytes,
+                        sheet_media_type=analysis.sheet_media_type,
+                        header=header,
+                        sampled_count=analysis.sampled_count,
+                        total_frames=analysis.meta.frame_count,
+                        task_name=cfg.vlm.task_name.strip(),
+                        model_name=cfg.vlm.model_name.strip(),
+                        temperature=cfg.vlm.temperature,
+                        max_tokens=tokens,
+                        max_chars=cfg.vlm.max_chars,
+                    )
+                    known = True
+                    if self._valid(epoch) and cfg.cache.enabled:
+                        await self._cache.put(
+                            key,
+                            header=header,
+                            description=result,
+                            kind=analysis.meta.kind,
+                        )
+                    return result
+                except VlmEmptyResponseError:
+                    known = True  # A completed empty response is not an unknown RPC attempt.
+                    raise
+                finally:
+                    await self._cache.end(attempt_key, known=known)
 
-    def _cache_key(self, data: bytes) -> str:
-        """计算“内容 + 影响描述结果的配置”缓存键。"""
+            request = self._track(asyncio.create_task(call()), self._requests)
+            try:
+                description = await asyncio.wait_for(
+                    asyncio.shield(request),
+                    max(
+                        0.001,
+                        min(cfg.vlm.timeout_ms / 1000, deadline - time.monotonic()),
+                    ),
+                )
+                return self._format_text(header, description, cfg=cfg)
+            except VlmEmptyResponseError:
+                retry_tokens = min(
+                    max(max_tokens * 2, EMPTY_RESPONSE_RETRY_MIN_TOKENS),
+                    EMPTY_RESPONSE_RETRY_MAX_TOKENS,
+                )
+                if retry_tokens <= max_tokens:
+                    break
+                max_tokens = retry_tokens
+            except asyncio.TimeoutError:
+                self._logger.warning(
+                    "动图识别等待超时；保留在途占用，不重发，远端费用/取消状态未知"
+                )
+                break
+            except Exception:
+                self._logger.warning("动图识别失败；错误正文已省略，保留未知请求记录")
+                break
+        return self._format_text(header, "", note="视觉描述不可用", cfg=cfg)
 
-        cfg = self._config
-        fingerprint = "|".join(
-            [
-                PROMPT_VERSION,
-                cfg.vlm.task_name.strip(),
-                cfg.vlm.model_name.strip(),
-                str(cfg.vlm.max_chars),
-                str(cfg.frames.max_frames),
-                str(cfg.frames.max_edge),
-                str(cfg.frames.max_sheet_pixels),
-                str(cfg.frames.background),
-            ]
-        )
-        content_digest = hashlib.sha256(data).hexdigest()
-        config_digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()
-        return f"{content_digest}:{config_digest}"
-
-    async def _get_cached(self, cache_key: str) -> dict[str, Any] | None:
-        """读取描述缓存。"""
-
-        if self._cache is None:
-            return None
-        entry = await self._cache.get(cache_key)
-        if entry is None:
-            return None
-        header = entry.get("header")
-        description = entry.get("description")
-        if not isinstance(header, str) or not isinstance(description, str):
-            return None
-        self._logger.debug("动图描述命中缓存: %s", cache_key[:12])
-        return entry
-
-    async def _store_cached(self, cache_key: str, *, header: str, description: str, kind: str) -> None:
-        """写入描述缓存。"""
-
-        if self._cache is None:
-            return
-        await self._cache.put(cache_key, header=header, description=description, kind=kind)
-
-    def _format_text(self, header: str, description: str, *, note: str = "") -> str:
+    def _format_text(
+        self, header: str, description: str, *, note: str = "", cfg=None
+    ) -> str:
         """构造最终注入到聊天中的文本。"""
 
-        cfg = self._config
+        cfg = cfg or self._config
         prefix = cfg.inject.prefix.strip()
         if cfg.inject.include_metadata and header:
             leading = f"{prefix} {header}".strip() if prefix else header

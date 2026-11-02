@@ -81,7 +81,10 @@ class AnimationProcessorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("GIF", texts[0])
 
             rewritten_components = result["raw_message"]  # type: ignore[index]
-            self.assertEqual(rewritten_components[0]["binary_data_base64"], component["binary_data_base64"])
+            self.assertEqual(
+                rewritten_components[0]["binary_data_base64"],
+                component["binary_data_base64"],
+            )
             self.assertEqual(rewritten_components[0]["hash"], component["hash"])
             self.assertEqual(len(llm.calls), 1)
 
@@ -134,7 +137,9 @@ class AnimationProcessorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(first)
             self.assertEqual(len(llm.calls), 1)
 
-            second = await processor.process_message(make_message([make_image_component(make_animated_gif())]))
+            second = await processor.process_message(
+                make_message([make_image_component(make_animated_gif())])
+            )
             self.assertIsNotNone(second)
             self.assertEqual(len(llm.calls), 1)
             self.assertEqual(self._texts(first), self._texts(second))  # type: ignore[arg-type]
@@ -144,7 +149,9 @@ class AnimationProcessorTests(unittest.IsolatedAsyncioTestCase):
         second_processor = self._build_processor(llm)
         await second_processor.initialize()
         try:
-            third = await second_processor.process_message(make_message([make_image_component(make_animated_gif())]))
+            third = await second_processor.process_message(
+                make_message([make_image_component(make_animated_gif())])
+            )
             self.assertIsNotNone(third)
             self.assertEqual(len(llm.calls), 1)
         finally:
@@ -154,7 +161,9 @@ class AnimationProcessorTests(unittest.IsolatedAsyncioTestCase):
         """思考模型吃满 max_tokens 时，应提高额度重试并拿到描述。"""
 
         llm = FakeLlm(responses=[EMPTY_RESPONSE_RESULT])
-        processor = self._build_processor(llm)
+        config = ReadAnimationConfig()
+        config.vlm.retry_empty_response = True
+        processor = self._build_processor(llm, config=config)
         await processor.initialize()
         try:
             message = make_message([make_image_component(make_animated_gif())])
@@ -172,7 +181,9 @@ class AnimationProcessorTests(unittest.IsolatedAsyncioTestCase):
         """两次都为空正文时降级为元信息，而不是编造内容。"""
 
         llm = FakeLlm(responses=[EMPTY_RESPONSE_RESULT, EMPTY_RESPONSE_RESULT])
-        processor = self._build_processor(llm)
+        config = ReadAnimationConfig()
+        config.vlm.retry_empty_response = True
+        processor = self._build_processor(llm, config=config)
         await processor.initialize()
         try:
             message = make_message([make_image_component(make_animated_gif())])
@@ -208,7 +219,9 @@ class AnimationProcessorTests(unittest.IsolatedAsyncioTestCase):
             message = make_message(
                 [
                     make_image_component(make_animated_gif()),
-                    make_image_component(make_animated_gif(frame_count=6, duration=100)),
+                    make_image_component(
+                        make_animated_gif(frame_count=6, duration=100)
+                    ),
                 ]
             )
             result = await processor.process_message(message)
@@ -226,7 +239,9 @@ class AnimationProcessorTests(unittest.IsolatedAsyncioTestCase):
         processor = self._build_processor(llm)
         await processor.initialize()
         try:
-            message = make_message([make_image_component(make_animated_gif(), component_type="emoji")])
+            message = make_message(
+                [make_image_component(make_animated_gif(), component_type="emoji")]
+            )
             result = await processor.process_message(message)
             self.assertIsNotNone(result)
             self.assertEqual(len(llm.calls), 1)
@@ -240,10 +255,14 @@ class AnimationProcessorTests(unittest.IsolatedAsyncioTestCase):
         processor = self._build_processor(llm, config=config)
         await processor.initialize()
         try:
-            silent_message = make_message([make_image_component(make_animated_gif())], is_mentioned=False)
+            silent_message = make_message(
+                [make_image_component(make_animated_gif())], is_mentioned=False
+            )
             self.assertIsNone(await processor.process_message(silent_message))
 
-            mentioned_message = make_message([make_image_component(make_animated_gif())], is_mentioned=True)
+            mentioned_message = make_message(
+                [make_image_component(make_animated_gif())], is_mentioned=True
+            )
             self.assertIsNotNone(await processor.process_message(mentioned_message))
         finally:
             await processor.close()

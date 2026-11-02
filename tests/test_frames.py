@@ -34,7 +34,9 @@ class AnimationReaderTests(unittest.TestCase):
     """GIF/WebP 读取与帧渲染。"""
 
     def test_reads_gif_metadata(self) -> None:
-        reader = AnimationReader(make_animated_gif(frame_count=8, duration=80), "gif", max_scan_frames=3000)
+        reader = AnimationReader(
+            make_animated_gif(frame_count=8, duration=80), "gif", max_scan_frames=3000
+        )
         try:
             meta = reader.meta
             self.assertEqual(meta.kind, "gif")
@@ -49,7 +51,11 @@ class AnimationReaderTests(unittest.TestCase):
             reader.close()
 
     def test_reads_webp_metadata(self) -> None:
-        reader = AnimationReader(make_animated_webp(frame_count=6, duration=100), "webp", max_scan_frames=3000)
+        reader = AnimationReader(
+            make_animated_webp(frame_count=6, duration=100),
+            "webp",
+            max_scan_frames=3000,
+        )
         try:
             meta = reader.meta
             self.assertEqual(meta.kind, "webp")
@@ -59,7 +65,9 @@ class AnimationReaderTests(unittest.TestCase):
             reader.close()
 
     def test_scan_truncation_is_reported(self) -> None:
-        reader = AnimationReader(make_animated_gif(frame_count=8), "gif", max_scan_frames=3)
+        reader = AnimationReader(
+            make_animated_gif(frame_count=8), "gif", max_scan_frames=3
+        )
         try:
             self.assertTrue(reader.meta.scan_truncated)
             with self.assertRaises(Exception):
@@ -68,7 +76,9 @@ class AnimationReaderTests(unittest.TestCase):
             reader.close()
 
     def test_samples_carry_timing(self) -> None:
-        reader = AnimationReader(make_animated_gif(frame_count=8, duration=80), "gif", max_scan_frames=3000)
+        reader = AnimationReader(
+            make_animated_gif(frame_count=8, duration=80), "gif", max_scan_frames=3000
+        )
         try:
             samples = reader.sample(4)
             self.assertEqual(len(samples), 4)
@@ -77,7 +87,10 @@ class AnimationReaderTests(unittest.TestCase):
             self.assertEqual(samples[0].duration_ms, 80)
             self.assertEqual(samples[-1].index, 7)
             self.assertEqual(samples[-1].start_ms, 560)
-            self.assertEqual([sample.index for sample in samples], sorted(sample.index for sample in samples))
+            self.assertEqual(
+                [sample.index for sample in samples],
+                sorted(sample.index for sample in samples),
+            )
         finally:
             reader.close()
 

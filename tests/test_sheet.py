@@ -56,7 +56,9 @@ class FrameSheetTests(unittest.TestCase):
     """验证帧板输出格式与尺寸。"""
 
     def test_white_sheet_is_jpeg(self) -> None:
-        reader = AnimationReader(make_animated_gif(frame_count=8, duration=80), "gif", max_scan_frames=3000)
+        reader = AnimationReader(
+            make_animated_gif(frame_count=8, duration=80), "gif", max_scan_frames=3000
+        )
         try:
             samples = reader.sample(8)
             data, media_type = build_frame_sheet(
@@ -76,7 +78,9 @@ class FrameSheetTests(unittest.TestCase):
             self.assertGreater(sheet.height, 100)
 
     def test_keep_alpha_sheet_is_png(self) -> None:
-        reader = AnimationReader(make_animated_gif(frame_count=4), "gif", max_scan_frames=3000)
+        reader = AnimationReader(
+            make_animated_gif(frame_count=4), "gif", max_scan_frames=3000
+        )
         try:
             samples = reader.sample(4)
             data, media_type = build_frame_sheet(
@@ -112,13 +116,16 @@ class FrameSheetTests(unittest.TestCase):
 
         measuring_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
         max_label_width = max(
-            int(measuring_draw.textlength(f"#{index}  t={index * 80}ms  d=80ms")) for index in range(2)
+            int(measuring_draw.textlength(f"#{index}  t={index * 80}ms  d=80ms"))
+            for index in range(2)
         )
         with Image.open(BytesIO(data)) as sheet:
             self.assertGreaterEqual(sheet.width, 2 * max_label_width)
 
     def test_banner_reports_timing(self) -> None:
-        reader = AnimationReader(make_animated_gif(frame_count=8, duration=80), "gif", max_scan_frames=3000)
+        reader = AnimationReader(
+            make_animated_gif(frame_count=8, duration=80), "gif", max_scan_frames=3000
+        )
         try:
             banner = build_sheet_banner(reader.meta)
         finally:

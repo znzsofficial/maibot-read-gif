@@ -1,109 +1,137 @@
-"""GIF 动图识别插件入口。
-
-拦截入站消息中的 GIF / 动态 WebP / APNG，抽取多帧拼成带时间标注的帧板，
-调用宿主视觉模型生成描述，再以文本段形式注入消息，供聊天模型理解动图。
-"""
+"""Read GIF: preserve raw IM, deliver derived descriptions only to request context."""
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-from maibot_sdk import (
-    CONFIG_RELOAD_SCOPE_SELF,
-    HookHandler,
-    MaiBotPlugin,
-)
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, HookHandler, MaiBotPlugin
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from .read_animation.config import ReadAnimationConfig
+from .read_animation.context import DerivedContext
 from .read_animation.pipeline import CACHE_FILE_NAME, AnimationProcessor
 
 HOOK_TIMEOUT_MS = 45000
 
 
 class ReadGifPlugin(MaiBotPlugin):
-    """GIF 动图识别插件。"""
-
     config_model = ReadAnimationConfig
 
-    def __init__(self) -> None:
-        """初始化插件状态。"""
-
+    def __init__(self):
         super().__init__()
-        self._processor: AnimationProcessor | None = None
+        self._processor = None
+        self._lifecycle = asyncio.Lock()
+        self._generation = 0
+        self._derived = DerivedContext()
 
-    async def on_load(self) -> None:
-        """插件加载：创建处理器并加载描述缓存。"""
-
-        cache_path = self.ctx.paths.data_dir / CACHE_FILE_NAME
-        self._processor = AnimationProcessor(
-            config=self.config,
-            llm_generate=self.ctx.llm.generate,
-            logger=self.ctx.logger,
-            cache_path=cache_path,
-        )
-        await self._processor.initialize()
-        self.ctx.logger.info(
-            "GIF 动图识别插件已加载（视觉任务: %s）",
-            self.config.vlm.task_name or "auto",
-        )
-        if int(self.config.vlm.max_tokens) < 2048:
-            self.ctx.logger.warning(
-                "GIF 动图识别: vlm.max_tokens 当前为 %s，若 vlm 任务是思考模型可能返回空描述；"
-                "已启用自动提高额度重试，建议把 max_tokens 调到 2048~4096",
-                self.config.vlm.max_tokens,
+    async def on_load(self):
+        async with self._lifecycle:
+            self._generation += 1
+            self._derived.clear()
+            if self._processor is not None:
+                await self._processor.close()
+            self._processor = AnimationProcessor(
+                config=self.config,
+                llm_generate=self.ctx.llm.generate,
+                logger=self.ctx.logger,
+                cache_path=self.ctx.paths.data_dir / CACHE_FILE_NAME,
             )
+            await self._processor.initialize()
+        self.ctx.logger.info(
+            "GIF 动图识别插件已加载（维护版0.2.0，原消息保真/派生上下文）"
+        )
 
-    async def on_unload(self) -> None:
-        """插件卸载：保存缓存并释放处理器。"""
-
-        if self._processor is not None:
-            await self._processor.close()
-            self._processor = None
+    async def on_unload(self):
+        async with self._lifecycle:
+            self._generation += 1
+            self._derived.clear()
+            processor, self._processor = self._processor, None
+            if processor is not None:
+                await processor.close()
         self.ctx.logger.info("GIF 动图识别插件已卸载")
 
-    async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
-        """插件配置热更新：重建缓存与并发控制。"""
-
+    async def on_config_update(
+        self, scope: str, config_data: dict[str, object], version: str
+    ):
         del config_data, version
-        if scope != CONFIG_RELOAD_SCOPE_SELF or self._processor is None:
-            return
-        await self._processor.update_config(self.config)
+        async with self._lifecycle:
+            if scope != CONFIG_RELOAD_SCOPE_SELF or self._processor is None:
+                return
+            self._generation += 1
+            self._derived.clear()
+            await self._processor.update_config(self.config)
         self.ctx.logger.info("GIF 动图识别配置已更新")
 
     @HookHandler(
         "chat.receive.before_process",
         name="animation_frame_sheet",
-        description="检测入站消息中的 GIF/WebP/APNG，抽帧生成视觉描述并注入消息文本。",
+        description="分析入站动图并保存短期派生描述，不改写用户原消息。",
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
         timeout_ms=HOOK_TIMEOUT_MS,
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_before_process(
-        self,
-        message: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any] | None:
-        """在消息进入宿主处理链之前补充动图描述。"""
-
-        del kwargs
-        processor = self._processor
+        self, message: dict[str, Any] | None = None, **kwargs
+    ):
+        processor, generation = self._processor, self._generation
         if processor is None or not isinstance(message, dict):
             return None
-
         try:
-            mutated_message = await processor.process_message(message)
+            notes = []
+            result = await processor.process_message(message, annotations=notes)
         except Exception:
-            self.ctx.logger.warning("处理入站消息中的 GIF 动图时出现异常", exc_info=True)
+            self.ctx.logger.warning("处理动图失败，保持原消息；错误正文已省略")
             return None
+        if (
+            result is not None
+            and generation == self._generation
+            and processor is self._processor
+        ):
+            self._derived.record(message, notes)
+        return None  # No generated text is returned to the raw IM/storage/learning pipeline.
 
-        if mutated_message is None:
+    def _request_context(self, **kwargs):
+        if (
+            self._processor is None
+            or not self.config.plugin.enabled
+            or self.config.trigger.trigger_mode == "off"
+        ):
             return None
-        return {"action": "continue", "modified_kwargs": {"message": mutated_message}}
+        items = self._derived.inject(
+            kwargs.get("items"),
+            session_id=kwargs.get("session_id", ""),
+            tool_definitions=kwargs.get("tool_definitions"),
+            item_schema_version=kwargs.get("item_schema_version"),
+            reply_message_id=kwargs.get("reply_message_id", ""),
+        )
+        if items is not None:
+            return {"action": "continue", "modified_kwargs": {**kwargs, "items": items}}
+        return None
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="animation_derived_planner",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=1000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def planner_context(self, **kwargs):
+        return self._request_context(**kwargs)
+
+    @HookHandler(
+        "maisaka.replyer.before_model_request",
+        name="animation_derived_replyer",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=1000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def replyer_context(self, **kwargs):
+        return self._request_context(**kwargs)
 
 
 def create_plugin() -> MaiBotPlugin:
-    """插件工厂函数，供 Runner 调用。"""
-
     return ReadGifPlugin()

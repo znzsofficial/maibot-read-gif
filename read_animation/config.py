@@ -22,7 +22,7 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"label": "启用插件"},
     )
     config_version: str = Field(
-        default="1.2.0",
+        default="1.3.0",
         description="配置版本号；修改配置结构时递增，Runner 会据此迁移配置。",
         json_schema_extra={"label": "配置版本"},
     )
@@ -94,12 +94,13 @@ class FramesSection(PluginConfigBase):
         default=8388608,
         ge=65536,
         le=67108864,
-        description="超过该字节数的图片直接跳过，避免过一次大的 RPC 负载。",
+        description="插件解码输入上限；超过直接跳过，不改变已发生的Host RPC预算。",
         json_schema_extra={"label": "最大输入字节"},
     )
     max_total_frames: int = Field(
         default=3000,
         ge=1,
+        le=3000,
         description="解析时长信息时最多扫描的帧数，超过时不做视觉识别。",
         json_schema_extra={"label": "最大解析帧数"},
     )
@@ -119,6 +120,12 @@ class FramesSection(PluginConfigBase):
             "调大更清晰但更慢更贵。"
         ),
         json_schema_extra={"label": "帧板像素预算"},
+    )
+    max_decode_pixels: int = Field(
+        default=160_000_000,
+        ge=1_000_000,
+        le=500_000_000,
+        description="扫描及渲染累计像素预算；超出跳过，不影响原图。",
     )
 
 
@@ -162,11 +169,15 @@ class VlmSection(PluginConfigBase):
         description="单次视觉识别超时毫秒数，超时后降级为仅注入元信息。",
         json_schema_extra={"label": "识别超时(ms)"},
     )
+    retry_empty_response: bool = Field(
+        default=False,
+        description="明确允许空正文后提高输出额度再试一次；可能额外计费，默认关闭。",
+    )
     max_chars: int = Field(
         default=300,
         ge=50,
         le=1000,
-        description="注入到聊天内容的描述最大字数。",
+        description="请求前派生动图描述最大字数，不写进用户原消息。",
         json_schema_extra={"label": "描述最大字数"},
     )
 
@@ -233,6 +244,12 @@ class PerfSection(PluginConfigBase):
         le=8,
         description="同时进行的视觉识别请求上限。",
         json_schema_extra={"label": "识别并发上限"},
+    )
+    max_pending: int = Field(
+        default=8,
+        ge=1,
+        le=32,
+        description="整条消息及唯一动图在途准入上限，满时直接跳过，不无界排队。",
     )
 
 

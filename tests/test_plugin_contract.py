@@ -54,7 +54,9 @@ class PluginContractTests(unittest.TestCase):
         self.addCleanup(sys.modules.pop, PLUGIN_MODULE_NAME, None)
 
     def test_manifest_is_valid_json_and_v2(self) -> None:
-        manifest = json.loads((PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8"))
+        manifest = json.loads(
+            (PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8")
+        )
         for key in (
             "manifest_version",
             "id",
@@ -93,12 +95,21 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(type(instance).get_config_model())
 
         components = instance.get_components()
-        hook_components = [component for component in components if component["type"] == "HOOK_HANDLER"]
-        self.assertEqual(len(hook_components), 1)
-        self.assertEqual(hook_components[0]["metadata"]["hook"], "chat.receive.before_process")
+        hook_components = [
+            component for component in components if component["type"] == "HOOK_HANDLER"
+        ]
+        self.assertEqual(
+            {item["metadata"]["hook"] for item in hook_components},
+            {
+                "chat.receive.before_process",
+                "maisaka.planner.before_request",
+                "maisaka.replyer.before_model_request",
+            },
+        )
 
         default_config = instance.build_default_config()
-        self.assertEqual(default_config["plugin"]["config_version"], "1.2.0")
+        self.assertEqual(default_config["plugin"]["config_version"], "1.3.0")
+        self.assertFalse(default_config["vlm"]["retry_empty_response"])
         self.assertGreaterEqual(default_config["vlm"]["max_tokens"], 2048)
         self.assertGreaterEqual(default_config["frames"]["max_sheet_pixels"], 100000)
         self.assertIn("trigger", default_config)
@@ -107,7 +118,7 @@ class PluginContractTests(unittest.TestCase):
         schema = instance.build_config_schema(
             plugin_id="github.fabiocsa.read-gif",
             plugin_name="GIF 动图识别",
-            plugin_version="0.1.2",
+            plugin_version="0.2.0",
         )
         self.assertIn("sections", schema)
         self.assertIn("plugin", schema["sections"])
@@ -123,7 +134,9 @@ class PluginContractTests(unittest.TestCase):
         fake_llm = FakeLlm()
         fake_ctx = SimpleNamespace(
             logger=logging.getLogger("read_animation_contract_test"),
-            paths=SimpleNamespace(data_dir=plugin_data_dir, runtime_dir=plugin_data_dir),
+            paths=SimpleNamespace(
+                data_dir=plugin_data_dir, runtime_dir=plugin_data_dir
+            ),
             llm=SimpleNamespace(generate=fake_llm),
         )
         instance._set_context(fake_ctx)
@@ -132,7 +145,26 @@ class PluginContractTests(unittest.TestCase):
         async def scenario() -> dict[str, Any] | None:
             await instance.on_load()
             try:
-                return await instance.handle_before_process(message=message)
+                original = json.dumps(message, sort_keys=True)
+                result = await instance.handle_before_process(message=message)
+                self.assertIsNone(result)
+                self.assertEqual(json.dumps(message, sort_keys=True), original)
+                items = [
+                    {
+                        "item_type": "UserMessageItem",
+                        "meta": {
+                            "item_id": "source",
+                            "logical_turn_id": None,
+                            "timestamp": "2026-11-02T12:00:00",
+                        },
+                        "parts": [
+                            {"type": "text", "text": '<message msg_id="msg-1">\n'}
+                        ],
+                    }
+                ]
+                return await instance.planner_context(
+                    items=items, item_schema_version=1, session_id="session-1"
+                )
             finally:
                 await instance.on_unload()
 
@@ -140,11 +172,8 @@ class PluginContractTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result["action"], "continue")  # type: ignore[index]
-        modified_message = result["modified_kwargs"]["message"]  # type: ignore[index]
         injected_texts = [
-            component["data"]
-            for component in modified_message["raw_message"]
-            if component.get("type") == "text"
+            part["text"] for part in result["modified_kwargs"]["items"][-1]["parts"]
         ]
         self.assertEqual(len(injected_texts), 1)
         self.assertIn("画面：", injected_texts[0])

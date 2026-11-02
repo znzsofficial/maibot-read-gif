@@ -1,162 +1,226 @@
-"""动图描述的本地 JSON 缓存。"""
+"""Single durable description/attempt store; corrupt or unknown data fails closed."""
 
 from __future__ import annotations
 
+import asyncio
+import json
+import math
+import os
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
-import asyncio
-import json
-import logging
-import os
-import time
+CACHE_VERSION = 2
+MAX_STORE_BYTES = 16 * 1024 * 1024
 
-CACHE_VERSION = 1
+
+async def finish_io(function, *args):
+    """Do not release a writer lock while its cancelled filesystem thread runs."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
 
 
 class DescriptionCache:
-    """按 key 缓存视觉描述，带淘汰与原子落盘。"""
-
     def __init__(
-        self,
-        path: Path,
-        *,
-        max_entries: int,
-        retention_days: int,
-        logger: logging.Logger,
+        self, path: Path | None, *, max_entries: int, retention_days: int, logger
     ) -> None:
-        """初始化缓存。
-
-        Args:
-            path: 缓存 JSON 文件路径。
-            max_entries: 最大条目数，0 表示不按数量淘汰。
-            retention_days: 保留天数，0 表示不按时间淘汰。
-            logger: 插件日志器。
-        """
-
         self._path = path
-        self._max_entries = max(0, int(max_entries))
-        self._retention_days = max(0, int(retention_days))
+        self._max_entries = max_entries
+        self._retention_days = retention_days
         self._logger = logger
         self._entries: dict[str, dict[str, Any]] = {}
+        self._attempts: dict[str, str] = {}
         self._lock = asyncio.Lock()
         self._dirty = False
+        self._healthy = True
 
     async def load(self) -> None:
-        """从磁盘加载缓存；文件不存在或损坏时从空缓存开始。"""
-
-        data = await asyncio.to_thread(self._read_cache_file)
         async with self._lock:
-            entries = data.get("entries") if isinstance(data, dict) else None
-            if isinstance(entries, dict):
-                self._entries = {
-                    str(key): dict(value)
-                    for key, value in entries.items()
-                    if isinstance(value, dict) and isinstance(value.get("description"), str)
-                }
+            try:
+                payload = await finish_io(self._read_cache_file)
+                if payload is None:
+                    return
+                if not isinstance(payload, dict) or payload.get("version") not in (
+                    1,
+                    CACHE_VERSION,
+                ):
+                    raise ValueError("unsupported cache version")
+                entries = payload.get("entries")
+                attempts = payload.get("attempts", {})
+                if (
+                    not isinstance(entries, dict)
+                    or not isinstance(attempts, dict)
+                    or len(attempts) > 8
+                ):
+                    raise ValueError("invalid cache shape")
+                for key, entry in entries.items():
+                    if (
+                        not isinstance(key, str)
+                        or len(key) > 256
+                        or not isinstance(entry, dict)
+                        or any(
+                            not isinstance(entry.get(k), str) or len(entry[k]) > 4096
+                            for k in ("header", "description", "kind")
+                        )
+                        or any(
+                            not isinstance(entry.get(k), (int, float))
+                            or not math.isfinite(entry[k])
+                            for k in ("created_at", "last_access")
+                        )
+                    ):
+                        raise ValueError("invalid cache entry")
+                if any(
+                    not isinstance(k, str)
+                    or len(k) > 256
+                    or v not in ("started", "unknown")
+                    for k, v in attempts.items()
+                ):
+                    raise ValueError("invalid attempt record")
+                self._entries = entries
+                # A previous process's started request has an unknown remote outcome.
+                self._attempts = {key: "unknown" for key in attempts}
+                self._prune()
+                self._dirty = False
+            except (OSError, ValueError, TypeError):
+                self._healthy = False
+                self._logger.warning(
+                    "动图缓存/请求记录损坏或不可读，保留原文件并停止新识别"
+                )
+
+    def _read_cache_file(self):
+        if self._path is None or not self._path.exists():
+            return None
+        if self._path.is_symlink() or self._path.stat().st_size > MAX_STORE_BYTES:
+            raise ValueError("unsafe cache file")
+        return json.loads(self._path.read_text(encoding="utf-8"))
+
+    def _prune(self):
+        now = time.time()
+        if self._retention_days > 0:
+            self._entries = {
+                key: value
+                for key, value in self._entries.items()
+                if 0 <= now - value["created_at"] < self._retention_days * 86400
+            }
+        if self._max_entries > 0 and len(self._entries) > self._max_entries:
+            ranked = sorted(
+                self._entries, key=lambda key: self._entries[key]["last_access"]
+            )
+            for key in ranked[: len(ranked) - self._max_entries]:
+                del self._entries[key]
+
+    async def configure(self, *, max_entries, retention_days):
+        async with self._lock:
+            self._max_entries, self._retention_days = max_entries, retention_days
             self._prune()
-            self._dirty = False
+            self._dirty = True
+            await self._save_locked()
 
-        self._logger.debug("动图描述缓存已加载: %s 条", len(self._entries))
-
-    def _read_cache_file(self) -> dict[str, Any] | None:
-        """同步读取缓存文件。"""
-
-        if not self._path.exists():
-            return None
-        try:
-            with self._path.open("r", encoding="utf-8") as cache_file:
-                payload = json.load(cache_file)
-        except Exception as exc:
-            self._logger.warning("读取动图描述缓存失败，将从空缓存开始: %s", exc)
-            return None
-        if not isinstance(payload, dict) or payload.get("version") != CACHE_VERSION:
-            return None
-        return payload
-
-    async def get(self, key: str) -> dict[str, Any] | None:
-        """读取缓存条目。
-
-        Args:
-            key: 缓存键。
-
-        Returns:
-            Optional[Dict[str, Any]]: 命中的条目副本；未命中返回 ``None``。
-        """
-
+    async def get(self, key):
         async with self._lock:
+            if not self._healthy:
+                return None
             entry = self._entries.get(key)
             if entry is None:
+                return None
+            age = time.time() - entry["created_at"]
+            if age < 0 or (
+                self._retention_days > 0 and age >= self._retention_days * 86400
+            ):
+                del self._entries[key]
+                self._dirty = True
                 return None
             entry["last_access"] = time.time()
             self._dirty = True
             return dict(entry)
 
-    async def put(self, key: str, *, header: str, description: str, kind: str) -> None:
-        """写入一条缓存。
-
-        Args:
-            key: 缓存键。
-            header: 注入用元信息头。
-            description: 视觉描述。
-            kind: 动图格式。
-        """
-
-        now = time.time()
+    async def put(self, key, *, header, description, kind):
         async with self._lock:
-            self._entries[key] = {
-                "header": header,
-                "description": description,
-                "kind": kind,
-                "created_at": now,
-                "last_access": now,
-            }
+            if not self._healthy:
+                return
+            now = time.time()
+            self._entries[key] = dict(
+                header=header,
+                description=description,
+                kind=kind,
+                created_at=now,
+                last_access=now,
+            )
             self._prune()
             self._dirty = True
+            await self._save_locked()
 
-    def _prune(self) -> None:
-        """按时间与数量淘汰缓存条目。"""
-
-        now = time.time()
-        if self._retention_days > 0:
-            expire_before = now - self._retention_days * 86400
-            self._entries = {
-                key: entry
-                for key, entry in self._entries.items()
-                if float(entry.get("created_at", 0.0)) >= expire_before
-            }
-
-        if self._max_entries > 0 and len(self._entries) > self._max_entries:
-            ranked = sorted(self._entries.items(), key=lambda item: float(item[1].get("last_access", 0.0)))
-            drop_count = len(self._entries) - self._max_entries
-            self._entries = dict(ranked[drop_count:])
-
-    async def save(self) -> None:
-        """把缓存原子写入磁盘（文件内容未变化时跳过）。"""
-
-        if not self._dirty:
-            return
+    async def begin(self, key, limit):
+        """Persist before dispatch. Unknown attempts occupy slots until reviewed."""
         async with self._lock:
-            payload = {
-                "version": CACHE_VERSION,
-                "entries": {key: dict(value) for key, value in self._entries.items()},
-            }
+            if (
+                not self._healthy
+                or key in self._attempts
+                or len(self._attempts) >= limit
+            ):
+                return False
+            self._attempts[key] = "started"
+            self._dirty = True
+            await self._save_locked()
+            return self._healthy
+
+    async def end(self, key, *, known):
+        async with self._lock:
+            if key not in self._attempts:
+                return
+            if known:
+                del self._attempts[key]
+            else:
+                self._attempts[key] = "unknown"
+            self._dirty = True
+            await self._save_locked()
+
+    async def save(self):
+        async with self._lock:
+            await self._save_locked()
+
+    async def _save_locked(self):
+        if not self._healthy or not self._dirty:
+            return
+        if self._path is None:
             self._dirty = False
-        await asyncio.to_thread(self._write_cache_file, payload)
-
-    def _write_cache_file(self, payload: dict[str, Any]) -> None:
-        """同步写入缓存文件。"""
-
+            return
+        payload = json.dumps(
+            dict(version=CACHE_VERSION, entries=self._entries, attempts=self._attempts),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(payload) > MAX_STORE_BYTES:
+            self._healthy = False
+            self._logger.warning("动图记录超过持久化预算，停止新识别并保留已有文件")
+            return
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path = self._path.with_suffix(f"{self._path.suffix}.tmp")
-            with temporary_path.open("w", encoding="utf-8") as cache_file:
-                json.dump(payload, cache_file, ensure_ascii=False, indent=2)
-            os.replace(temporary_path, self._path)
-        except Exception as exc:
-            self._logger.warning("写入动图描述缓存失败: %s", exc)
+            await finish_io(self._write_cache_file, payload)
+            self._dirty = False
+        except OSError:
+            self._healthy = False
+            self._logger.warning("动图记录保存失败，停止新识别；不覆盖损坏记录")
 
-    async def close(self) -> None:
-        """保存并释放缓存。"""
+    def _write_cache_file(self, payload):
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        if self._path.is_symlink():
+            raise OSError("unsafe cache destination")
+        fd, temporary = tempfile.mkstemp(
+            prefix=self._path.name + ".", suffix=".tmp", dir=self._path.parent
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self._path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
+    async def close(self):
         await self.save()

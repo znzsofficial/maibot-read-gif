@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Literal
+from bisect import bisect_right
+from threading import Event
+import time
 
 from PIL import Image
 
@@ -57,7 +60,16 @@ class AnimationReader:
     使用完毕后调用 :meth:`close` 释放。
     """
 
-    def __init__(self, data: bytes, kind: AnimationKind, *, max_scan_frames: int) -> None:
+    def __init__(
+        self,
+        data: bytes,
+        kind: AnimationKind,
+        *,
+        max_scan_frames: int,
+        max_decode_pixels: int = 160_000_000,
+        deadline: float = float("inf"),
+        cancelled: Event | None = None,
+    ) -> None:
         """打开动图并收集元信息。
 
         Args:
@@ -68,22 +80,37 @@ class AnimationReader:
 
         self._kind = kind
         self._max_scan_frames = max(1, int(max_scan_frames))
+        self._pixel_budget = max_decode_pixels
+        self._pixels = 0
+        self._deadline = deadline
+        self._cancelled = cancelled or Event()
         try:
             self._image = Image.open(BytesIO(data))
-            self._frame_count = int(getattr(self._image, "n_frames", 1) or 1)
         except Exception as exc:
             raise AnimationReadError(f"无法打开动图: {exc}") from exc
+        try:
+            self._first_frame = (
+                1 if kind == "apng" and self._image.info.get("default_image") else 0
+            )
+            self._durations: list[int] = []
+            self._prefix_ms: list[int] = [0]
+            self._scan_truncated = False
+            self._collect_durations()
+            self._meta = self._build_meta()
+        except BaseException:
+            self._image.close()
+            raise
 
-        image_width = int(self._image.width)
-        image_height = int(self._image.height)
-        if image_width <= 0 or image_height <= 0 or image_width * image_height > MAX_FRAME_PIXELS:
-            raise AnimationReadError(f"动图分辨率异常或过大: {image_width}x{image_height}")
-
-        self._durations: list[int] = []
-        self._prefix_ms: list[int] = [0]
-        self._scan_truncated = False
-        self._collect_durations()
-        self._meta = self._build_meta()
+    def _check_budget(self):
+        if self._cancelled.is_set() or time.monotonic() >= self._deadline:
+            raise AnimationReadError("动图解析已取消或超时")
+        width, height = self._image.size
+        pixels = width * height
+        if width <= 0 or height <= 0 or pixels > MAX_FRAME_PIXELS:
+            raise AnimationReadError("动图单帧像素超限")
+        self._pixels += pixels
+        if self._pixels > self._pixel_budget:
+            raise AnimationReadError("动图累计解码像素超限")
 
     @property
     def meta(self) -> AnimationMeta:
@@ -94,18 +121,24 @@ class AnimationReader:
     def _collect_durations(self) -> None:
         """逐帧读取 duration，并累积前缀和。"""
 
-        scan_count = min(self._frame_count, self._max_scan_frames)
-        for index in range(scan_count):
+        # Do not access Pillow.n_frames: for GIF it scans the entire input first.
+        self._check_budget()
+        for index in range(self._max_scan_frames + 1):
             try:
-                self._image.seek(index)
+                self._image.seek(index + self._first_frame)
+            except EOFError:
+                break
             except Exception as exc:
                 raise AnimationReadError(f"无法读取动图第 {index} 帧: {exc}") from exc
-
+            self._check_budget()
+            if index == self._max_scan_frames:
+                self._scan_truncated = True
+                break
             duration = self._frame_duration_ms(self._image.info)
             self._durations.append(duration)
             self._prefix_ms.append(self._prefix_ms[-1] + duration)
 
-        self._scan_truncated = scan_count < self._frame_count
+        self._frame_count = len(self._durations) + int(self._scan_truncated)
 
     @staticmethod
     def _frame_duration_ms(info: dict[str, object]) -> int:
@@ -113,7 +146,11 @@ class AnimationReader:
 
         raw_duration = info.get("duration")
         try:
-            duration = int(raw_duration) if raw_duration is not None else DEFAULT_FRAME_DURATION_MS
+            duration = (
+                int(raw_duration)
+                if raw_duration is not None
+                else DEFAULT_FRAME_DURATION_MS
+            )
         except (TypeError, ValueError):
             duration = DEFAULT_FRAME_DURATION_MS
         return duration if duration > 0 else DEFAULT_FRAME_DURATION_MS
@@ -156,7 +193,23 @@ class AnimationReader:
         if self._scan_truncated:
             raise AnimationReadError("动图帧数超过解析上限，无法采样")
 
-        indices = pick_frame_indices(self._frame_count, max_frames)
+        count = min(max(1, max_frames), self._frame_count)
+        total = self._prefix_ms[-1]
+        indices = sorted(
+            {
+                min(
+                    self._frame_count - 1,
+                    max(
+                        0,
+                        bisect_right(
+                            self._prefix_ms, (total - 1) * position / max(1, count - 1)
+                        )
+                        - 1,
+                    ),
+                )
+                for position in range(count)
+            }
+        )
         return [
             FrameSample(
                 index=index,
@@ -166,7 +219,9 @@ class AnimationReader:
             for index in indices
         ]
 
-    def render_frame(self, index: int, *, max_edge: int, background: str) -> Image.Image:
+    def render_frame(
+        self, index: int, *, max_edge: int, background: str
+    ) -> Image.Image:
         """渲染指定帧并缩放到目标长边。
 
         Args:
@@ -185,7 +240,9 @@ class AnimationReader:
             raise AnimationReadError(f"帧序号超出范围: {index}")
 
         try:
-            self._image.seek(index)
+            self._check_budget()
+            self._image.seek(index + self._first_frame)
+            self._check_budget()
             frame = self._image.convert("RGBA")
         except Exception as exc:
             raise AnimationReadError(f"渲染动图第 {index} 帧失败: {exc}") from exc
@@ -228,7 +285,9 @@ def pick_frame_indices(frame_count: int, requested: int) -> list[int]:
     if count >= frame_count:
         return list(range(frame_count))
 
-    candidates = [round(position * (frame_count - 1) / (count - 1)) for position in range(count)]
+    candidates = [
+        round(position * (frame_count - 1) / (count - 1)) for position in range(count)
+    ]
     indices: list[int] = []
     for candidate in candidates:
         if not indices or indices[-1] != candidate:

@@ -24,7 +24,9 @@ def _make_frame(index: int, size: tuple[int, int] = FRAME_SIZE) -> Image.Image:
     return frame
 
 
-def _save_animation(frames: list[Image.Image], *, fmt: str, duration: int, loop: int) -> bytes:
+def _save_animation(
+    frames: list[Image.Image], *, fmt: str, duration: int, loop: int
+) -> bytes:
     """把多帧保存为动图字节。"""
 
     buffer = BytesIO()
@@ -51,14 +53,18 @@ def make_animated_gif(
     return _save_animation(frames, fmt="GIF", duration=duration, loop=loop)
 
 
-def make_animated_webp(frame_count: int = 6, duration: int = 100, loop: int = 0) -> bytes:
+def make_animated_webp(
+    frame_count: int = 6, duration: int = 100, loop: int = 0
+) -> bytes:
     """生成指定帧数的 WebP 动图。"""
 
     frames = [_make_frame(index) for index in range(frame_count)]
     return _save_animation(frames, fmt="WEBP", duration=duration, loop=loop)
 
 
-def make_animated_png(frame_count: int = 5, duration: int = 120, loop: int = 0) -> bytes:
+def make_animated_png(
+    frame_count: int = 5, duration: int = 120, loop: int = 0
+) -> bytes:
     """生成指定帧数的 APNG 动图。"""
 
     frames = [_make_frame(index) for index in range(frame_count)]
@@ -95,7 +101,9 @@ def make_broken_gif() -> bytes:
     return b"GIF89a" + b"\x00" * 32
 
 
-def make_image_component(data: bytes, *, component_type: str = "image") -> dict[str, Any]:
+def make_image_component(
+    data: bytes, *, component_type: str = "image"
+) -> dict[str, Any]:
     """构造插件 Hook 载荷中的图片/表情组件字典。"""
 
     return {
@@ -124,7 +132,9 @@ def make_message(
                 "user_nickname": "测试群友",
                 "user_cardname": None,
             },
-            "group_info": {"group_id": group_id, "group_name": "测试群"} if group_id else None,
+            "group_info": {"group_id": group_id, "group_name": "测试群"}
+            if group_id
+            else None,
             "additional_config": {},
         },
         "raw_message": components,
