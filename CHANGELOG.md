@@ -42,3 +42,7 @@
 - Fix pre-process mention timing, cumulative-time sampling, APNG poster handling and actual pixel budgets.
 - Keep default4096 output tokens; empty-response escalation is opt-in, unknown/timeout requests never automatically replay.
 - Add actual-SDK offline tests, allowlisted isolated packaging and exact-commit two-platform CI gates; no auto-deployment.
+# 0.2.1 — gatekeeper admission ordering
+
+- Run GIF recognition in NORMAL order after EARLY gatekeeper admission; blocked messages never enter GIF decoding/VLM.
+- Preserve default4096, opt-in empty-response retry, raw messages and separate native emoji tagging.

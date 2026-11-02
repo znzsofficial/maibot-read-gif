@@ -98,6 +98,10 @@ class PluginContractTests(unittest.TestCase):
         hook_components = [
             component for component in components if component["type"] == "HOOK_HANDLER"
         ]
+        receive = next(
+            c for c in hook_components if c["name"] == "animation_frame_sheet"
+        )
+        self.assertEqual(receive["metadata"]["order"], "normal")
         self.assertEqual(
             {item["metadata"]["hook"] for item in hook_components},
             {
@@ -118,7 +122,7 @@ class PluginContractTests(unittest.TestCase):
         schema = instance.build_config_schema(
             plugin_id="github.fabiocsa.read-gif",
             plugin_name="GIF 动图识别",
-            plugin_version="0.2.0",
+            plugin_version="0.2.1",
         )
         self.assertIn("sections", schema)
         self.assertIn("plugin", schema["sections"])

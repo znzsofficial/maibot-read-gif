@@ -38,9 +38,7 @@ class ReadGifPlugin(MaiBotPlugin):
                 cache_path=self.ctx.paths.data_dir / CACHE_FILE_NAME,
             )
             await self._processor.initialize()
-        self.ctx.logger.info(
-            "GIF 动图识别插件已加载（维护版0.2.0，原消息保真/派生上下文）"
-        )
+        self.ctx.logger.info("GIF 动图识别插件已加载（维护版0.2.1，门卫准入后识别）")
 
     async def on_unload(self):
         async with self._lifecycle:
@@ -68,7 +66,7 @@ class ReadGifPlugin(MaiBotPlugin):
         name="animation_frame_sheet",
         description="分析入站动图并保存短期派生描述，不改写用户原消息。",
         mode=HookMode.BLOCKING,
-        order=HookOrder.EARLY,
+        order=HookOrder.NORMAL,
         timeout_ms=HOOK_TIMEOUT_MS,
         error_policy=ErrorPolicy.SKIP,
     )
