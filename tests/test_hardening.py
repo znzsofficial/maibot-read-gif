@@ -92,6 +92,34 @@ class CacheTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_simultaneous_distinct_jobs_reserve_decode_slots_atomically(self):
+        cfg = ReadAnimationConfig()
+        cfg.perf.max_concurrent = 2
+        processor = await self.build(cfg=cfg)
+        release = threading.Event()
+
+        def blocked(*args, **kwargs):
+            release.wait(5)
+            return None
+
+        with patch("read_animation.pipeline.analyze_animation", side_effect=blocked):
+            tasks = [
+                asyncio.create_task(
+                    processor.process_message(
+                        make_message(
+                            [make_image_component(make_animated_gif(frame_count=n))]
+                        )
+                    )
+                )
+                for n in (3, 4, 5, 6)
+            ]
+            try:
+                await asyncio.sleep(0.05)
+                self.assertEqual(len(processor._decodes), 2)
+            finally:
+                release.set()
+                await asyncio.gather(*tasks)
+
     async def test_timeout_keeps_actual_request_and_late_success_is_cached(self):
         entered, release = asyncio.Event(), asyncio.Event()
         calls = 0

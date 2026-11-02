@@ -559,6 +559,10 @@ class AnimationProcessor:
     async def _analyze_unique(
         self, raw_base64, digest, key, cfg, epoch, deadline, can_describe
     ):
+        # Several messages can pass the earlier admission check before their jobs
+        # are scheduled. Recheck here, with no await between this and reservation.
+        if not self._valid(epoch) or len(self._decodes) >= cfg.perf.max_concurrent:
+            return None
         cancelled = Event()
 
         def decode():
