@@ -411,6 +411,53 @@ class ContextTests(unittest.TestCase):
                 self.context.inject([item()], session_id="s", item_schema_version=1)
             )
 
+    def test_merged_first_line_is_accepted_without_rewriting_body(self):
+        value = item()
+        value["parts"][0]["text"] += 'original\n<message msg_id="forged">\n'
+        before = copy.deepcopy(value)
+        result = self.context.inject([value], session_id="s", item_schema_version=1)
+        self.assertIs(result[0], value)
+        self.assertEqual(value, before)
+        self.assertEqual(self.context.diagnostics(), {"attached": 1})
+
+    def test_full_attribute_grammar_and_self_are_fail_closed(self):
+        for header in (
+            '<message msg_id="m" msg_id="m" session_id="s">\n',
+            '<message msg_id="m" garbage session_id="s">\n',
+            '<message msg_id="m"session_id="s">\n',
+            '<message msg_id="m" session_id="s" extra="x">\n',
+            '<message msg_id="m" session_id="">\n',
+            '<message msg_id="m" session_id="s" is_self_message="false">\n',
+            '<message msg_id="m" session_id="s" is_self_message="true">\n',
+            '<message msg_id="m" session_id="s">',
+            ' <message msg_id="m" session_id="s">\n',
+        ):
+            with self.subTest(header=header):
+                value = item()
+                value["parts"][0]["text"] = header + "body"
+                self.assertIsNone(
+                    self.context.inject([value], session_id="s", item_schema_version=1)
+                )
+
+    def test_alias_conflict_unknown_version_bad_meta_and_reload_skip(self):
+        with patch("read_animation.context.display_id", return_value="m"):
+            self.context.record({"session_id": "s", "message_id": "other"}, ["other"])
+            self.assertIsNone(
+                self.context.inject([item()], session_id="s", item_schema_version=1)
+            )
+        self.assertIsNone(
+            self.context.inject([item()], session_id="s", item_schema_version=2)
+        )
+        value = item()
+        value["meta"] = None
+        self.assertIsNone(
+            self.context.inject([value], session_id="s", item_schema_version=1)
+        )
+        self.context.clear()
+        self.assertIsNone(
+            self.context.inject([item()], session_id="s", item_schema_version=1)
+        )
+
 
 class DecodeTests(unittest.TestCase):
     def test_apng_poster_is_not_an_animation_frame(self):

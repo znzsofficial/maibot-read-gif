@@ -122,7 +122,7 @@ class PluginContractTests(unittest.TestCase):
         schema = instance.build_config_schema(
             plugin_id="github.fabiocsa.read-gif",
             plugin_name="GIF 动图识别",
-            plugin_version="0.2.1",
+            plugin_version="0.2.2",
         )
         self.assertIn("sections", schema)
         self.assertIn("plugin", schema["sections"])

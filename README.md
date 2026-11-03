@@ -4,7 +4,7 @@
 保留完整上游历史、作者和MIT许可，不是独立原创。原插件思路参考
 [dsh-read-animation](https://github.com/NeoHotaru/dsh-read-animation)，归属见 [NOTICE.md](NOTICE.md)。
 
-当前维护版 **0.2.1**，要求 **MaiBot >=1.3.19、SDK >=2.20.0、Python >=3.12**。
+当前维护版 **0.2.2**，要求 **MaiBot >=1.3.19、SDK >=2.20.0、Python >=3.12**。
 插件ID仍为`github.fabiocsa.read-gif`，不与原版双开，不更换原数据目录。
 
 ## 做什么
@@ -14,7 +14,8 @@
 - **原消息不改写**：生成描述不再追加为用户TextComponent，不写进原聊天记录或原消息学习输入。
   描述保留在512条/15分钟内存索引中，仅在Planner/Replyer请求前以独立、不可信的派生Item补入。
 - 普通聊天按真实会话和消息ID关联；共享Focus从Host的reply工具Schema读取允许会话，
-  只认真实UserMessageItem首段的Host消息前缀；不从用户正文/群名猜归属。Replyer兼容Host原始目标消息ID。
+  只认真实UserMessageItem首段偏移0的Host首行（包括与用户文字合并的part），严格检查完整属性；
+  不从用户正文/群名猜归属。Replyer兼容Host原始目标消息ID。
   无法可靠匹配就跳过，不修改工具调用/输出/原Item/路由或provider replay。
 
 描述仍可能影响模型的后续回复或其自然记忆，不能宣称完全不会间接进入摘要；
@@ -22,6 +23,10 @@
 15分钟到期/进程重载后缺失的关联不从聊天正文猜回；描述内容缓存与该短期索引是不同用途。
 
 ## 本次加固
+
+- 0.2.2修复Host把前缀与首段用户文字合并时漏附加派生描述；不扫描正文标签或改变原Item/replay。
+  内存`DerivedContext.diagnostics()`仅提供饱和reason计数（附加/目标附加、拒绝或未匹配），
+  不记录ID、QQ、正文、URL或模型响应；不增加模型请求。
 
 - 入站识别使用BLOCKING/NORMAL，晚于门卫BLOCKING/EARLY；被门卫abort的消息不会进入本插件解码/VLM。
   原生表情标签与本插件动态描述仍分工独立，不宣称两条识别链全局去重；不关闭原生图片/表情注册。

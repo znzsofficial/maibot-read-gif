@@ -38,7 +38,7 @@ class ReadGifPlugin(MaiBotPlugin):
                 cache_path=self.ctx.paths.data_dir / CACHE_FILE_NAME,
             )
             await self._processor.initialize()
-        self.ctx.logger.info("GIF 动图识别插件已加载（维护版0.2.1，门卫准入后识别）")
+        self.ctx.logger.info("GIF 动图识别插件已加载（维护版0.2.2，门卫准入后识别）")
 
     async def on_unload(self):
         async with self._lifecycle:

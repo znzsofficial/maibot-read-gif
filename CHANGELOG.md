@@ -46,3 +46,7 @@
 
 - Run GIF recognition in NORMAL order after EARLY gatekeeper admission; blocked messages never enter GIF decoding/VLM.
 - Preserve default4096, opt-in empty-response retry, raw messages and separate native emoji tagging.
+# 0.2.2 — Host first-line context matching
+
+- Match the offset-zero Host header even when merged with user text; validate complete attributes and preserve scope, aliases and original items.
+- Add real Host prefix/serialization roundtrip contracts and content-free bounded reason counters; no extra model calls or Host changes.

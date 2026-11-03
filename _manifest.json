@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.fabiocsa.read-gif",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "name": "GIF 动图识别（Read GIF）",
   "description": "检测聊天里的 GIF / 动态 WebP / APNG，抽取多帧拼成带时间标注的帧板，调用宿主视觉模型生成动图描述并注入消息，让麦麦真正看懂动图。",
   "author": {

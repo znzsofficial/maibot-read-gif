@@ -7,10 +7,49 @@ import hashlib
 import json
 import re
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from html import unescape
 
 PREFIX = "github.fabiocsa.read-gif.derived:"
+HOST_ATTRIBUTES = frozenset(
+    {
+        "msg_id",
+        "session_id",
+        "chat_name",
+        "quote",
+        "time",
+        "user",
+        "group_card",
+        "is_self_message",
+    }
+)
+
+
+def host_header(text):
+    """Only offset-zero Host first line, never search user/quoted body for identity."""
+    if not isinstance(text, str):
+        return None
+    line = text[:2059].partition("\n")[0]
+    if "\n" not in text[:2059]:
+        return None
+    match = re.fullmatch(r"<message ([^>\r\n]{1,2048})>", line)
+    if match is None:
+        return None
+    raw = match[1]
+    # Validate the entire attribute grammar, not just substrings found by findall.
+    if re.fullmatch(r'[a-z_]+="[^"<>\r\n]*"(?: [a-z_]+="[^"<>\r\n]*")*', raw) is None:
+        return None
+    pairs = re.findall(r'([a-z_]+)="([^"]*)"', raw)
+    attrs = dict(pairs)
+    if (
+        len(pairs) != len(attrs)
+        or not attrs.keys() <= HOST_ATTRIBUTES
+        or not attrs.get("msg_id")
+        or ("session_id" in attrs and not attrs["session_id"])
+        or ("is_self_message" in attrs and attrs["is_self_message"] != "true")
+    ):
+        return None
+    return attrs
 
 
 def display_id(value):
@@ -60,6 +99,14 @@ def scopes(session_id, definitions):
 class DerivedContext:
     def __init__(self):
         self._records = OrderedDict()
+        # Fixed reason keys and saturated counts only; no IDs, text or model output.
+        self._diagnostics = Counter()
+
+    def _count(self, reason):
+        self._diagnostics[reason] = min(self._diagnostics[reason] + 1, 2**31 - 1)
+
+    def diagnostics(self):
+        return dict(self._diagnostics)
 
     def clear(self):
         self._records.clear()
@@ -99,16 +146,18 @@ class DerivedContext:
         reply_message_id="",
     ):
         if item_schema_version != 1 or not isinstance(items, list) or len(items) > 4096:
+            self._count("schema_rejected")
             return None
         allowed = scopes(session_id, tool_definitions)
         if not allowed:
+            self._count("scope_rejected")
             return None
         self._prune()
         output, used, total = [], set(), 0
         existing = {
-            item.get("meta", {}).get("item_id")
+            item["meta"].get("item_id")
             for item in items
-            if isinstance(item, dict)
+            if isinstance(item, dict) and isinstance(item.get("meta"), dict)
         }
         for item in items:
             output.append(item)
@@ -119,28 +168,21 @@ class DerivedContext:
                 not isinstance(parts, list)
                 or not parts
                 or not isinstance(parts[0], dict)
+                or parts[0].get("type") != "text"
             ):
                 continue
-            text = parts[0].get("text")
-            match = (
-                re.fullmatch(r"<message ([^>]{1,2048})>\n", text)
-                if isinstance(text, str)
-                else None
-            )
-            if match is None:
+            attrs = host_header(parts[0].get("text"))
+            if attrs is None:
+                self._count("header_rejected")
                 continue
-            pairs = re.findall(r'([a-z_]+)="([^"]*)"', match[1])
-            attrs = dict(pairs)
-            if (
-                len(pairs) != len(attrs)
-                or "msg_id" not in attrs
-                or attrs.get("is_self_message") == "true"
-            ):
+            if attrs.get("is_self_message") == "true":
+                self._count("self_rejected")
                 continue
             source = unescape(attrs.get("session_id", "")) or (
                 session_id if session_id else ""
             )
             if source not in allowed:
+                self._count("source_rejected")
                 continue
             candidates = [
                 (key, value)
@@ -148,19 +190,24 @@ class DerivedContext:
                 if key[0] == source and display_id(key[1]) == unescape(attrs["msg_id"])
             ]
             if len(candidates) != 1:
+                self._count("record_unmatched")
                 continue
             key, (_, notes) = candidates[0]
             identity = PREFIX + hashlib.sha256(json.dumps(key).encode()).hexdigest()
             if identity in existing or identity in used:
+                self._count("already_attached")
                 continue
             payload = json.dumps(
                 {"session_id": source, "message_id": key[1], "descriptions": notes},
                 ensure_ascii=False,
             )
             if len(payload) > 4000 or total + len(payload) > 6000 or len(used) >= 8:
+                self._count("capacity_rejected")
                 continue
-            timestamp = item.get("meta", {}).get("timestamp")
+            meta = item.get("meta")
+            timestamp = meta.get("timestamp") if isinstance(meta, dict) else None
             if not isinstance(timestamp, str):
+                self._count("meta_rejected")
                 continue
             output.append(
                 {
@@ -180,6 +227,7 @@ class DerivedContext:
                 }
             )
             used.add(identity)
+            self._count("attached")
             total += len(payload)
         # Replyer also provides an authoritative original target ID (including retro prompts).
         target = (
@@ -203,6 +251,7 @@ class DerivedContext:
             timestamp = (
                 items[-1].get("meta", {}).get("timestamp")
                 if isinstance(items[-1], dict)
+                and isinstance(items[-1].get("meta"), dict)
                 else None
             )
             if (
@@ -229,4 +278,5 @@ class DerivedContext:
                     }
                 )
                 used.add(identity)
+                self._count("target_attached")
         return output if used else None
