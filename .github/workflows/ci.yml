@@ -13,7 +13,7 @@ concurrency:
 jobs:
   tests:
     name: runtime (${{ matrix.case }})
-    if: github.repository == 'znzsofficial/maibot-read-gif'
+    if: github.repository == 'RoselindLabs/maibot-read-gif'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
